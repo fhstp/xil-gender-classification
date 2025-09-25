@@ -48,9 +48,12 @@ Since MS COCO does not natively provide annotations for gender or sex, a **manua
 
 ## 📖 Citation
 If you use this work, please cite:
-@article{tbd,
-  title={Explanatory Interactive Machine Learning for Bias Mitigation in Visual Gender Classification},
-  author={Slijepcevic, Djordje and Labadie, Roberto and Chen, Xihui and Böck, Adrian Jaques and Babic, Andreas and Zeppelzauer, Matthias},
-  journal={Journal Name},
-  year={2025}
-}
+```bibtex
+  @article{tbd,
+    title={Explanatory Interactive Machine Learning for Bias Mitigation in Visual Gender Classification},
+    author={Slijepcevic, Djordje and Labadie, Roberto and Chen, Xihui and Böck, Adrian Jaques and Babic, Andreas and Zeppelzauer, Matthias},
+    journal={Journal Name},
+    year={2025}
+  }
+```
+
