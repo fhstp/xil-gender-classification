@@ -66,21 +66,31 @@ class GradCAM:
         if len(input_image.shape) == 3:
             input_image = input_image.unsqueeze(0)
             
-        input_image = input_image.requires_grad_()
-        
-        # Forward pass
-        self.model.eval()
-        output = self.model(input_image)
-        
-        # Get target class
-        if class_idx is None:
-            class_idx = output.argmax(dim=1).item()
+        # Enable gradients for inputs if not already enabled, though not strictly required for GradCAM itself on features
+        # we need model parameters to require grad, so ensure the model isn't completely frozen or in no_grad mode
+        if not hasattr(self, '_was_eval'):
+            self._was_eval = not self.model.training
             
-        # Zero gradients
-        self.model.zero_grad()
-        
-        # Backward pass for target class
-        output[0, class_idx].backward(retain_graph=True)
+        self.model.eval()
+        # To compute gradients w.r.t the feature maps, we must enable grad calculation
+        with torch.set_grad_enabled(True):
+            input_image = input_image.clone().requires_grad_(True)
+            output = self.model(input_image)
+            
+            # Extract output correctly if the model returns a tuple
+            if isinstance(output, tuple):
+                output = output[0]
+                
+            # Get target class
+            if class_idx is None:
+                class_idx = output.argmax(dim=1).item()
+                
+            # Zero gradients
+            self.model.zero_grad()
+            
+            # Backward pass for target class
+            output[0, class_idx].backward()
+
         
         # Generate CAM
         gradients = self.gradients[0]  # (C, H, W)

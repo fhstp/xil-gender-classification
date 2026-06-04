@@ -207,18 +207,23 @@ def evaluate_model_bias(model,
         Dictionary of averaged metrics
     """
     model.eval()
-    
+
     all_ffp = []
     all_bfp = []
     all_bsr = []
     all_dice = []
-    
+
+    total_batches = len(dataloader)
     with torch.no_grad():
-        for batch in dataloader:
-            if len(batch) == 3:
-                images, labels, masks = batch
+        for batch_idx, batch in enumerate(dataloader):
+            if len(batch) >= 5: # XIL Dataset (image, label, feedback_mask, foreground_mask, metadata)
+                images = batch[0]
+                labels = batch[1]
+                masks = batch[3] # foreground_mask
+            elif len(batch) == 3:
+                images, masks, labels = batch  # GenderDataset order: (image, mask, label)
             else:
-                images, labels = batch
+                images, labels = batch[:2]
                 masks = None
                 
             images = images.to(device)
@@ -227,7 +232,8 @@ def evaluate_model_bias(model,
                 masks = masks.to(device)
             
             batch_size = images.shape[0]
-            
+            print(f"     bias metrics batch {batch_idx+1}/{total_batches} ({len(all_ffp)+batch_size} samples)...", flush=True)
+
             for i in range(batch_size):
                 image = images[i:i+1]  # Keep batch dimension
                 label = labels[i]

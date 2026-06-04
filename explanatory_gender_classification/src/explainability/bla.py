@@ -78,15 +78,16 @@ class BLAWrapper:
     compatible with the XIL framework.
     """
     
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, device=None):
         """
         Initialize BLA wrapper.
-        
+
         Args:
-            model: Model that includes BLA module
+            model:  Model that returns (logits, attention_weights)
+            device: Inference device; inferred from model parameters if None
         """
         self.model = model
-        self.device = next(model.parameters()).device
+        self.device = device if device is not None else next(model.parameters()).device
         
     def generate_explanation(self, 
                            images: torch.Tensor, 

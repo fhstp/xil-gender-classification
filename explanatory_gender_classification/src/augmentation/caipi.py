@@ -127,23 +127,22 @@ class CAIPIAugmentation:
         """
         counterexamples = []
         
-        # Convert tensors to numpy for processing
+        # ImageNet normalization constants (must undo before PIL operations)
+        _mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        _std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+        # Convert tensors to numpy — always denormalize from ImageNet range to [0, 255]
         if len(image.shape) == 3:
-            image_np = image.permute(1, 2, 0).cpu().numpy()
+            image_denorm = (image.cpu() * _std + _mean).clamp(0.0, 1.0)
+            image_np = (image_denorm.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         else:
             image_np = image.cpu().numpy()
-            
+
         if len(mask.shape) == 3:
             mask_np = mask.squeeze(0).cpu().numpy()
         else:
             mask_np = mask.cpu().numpy()
-            
-        # Normalize image to 0-255 range for PIL operations
-        if image_np.max() <= 1.0:
-            image_np = (image_np * 255).astype(np.uint8)
-        else:
-            image_np = image_np.astype(np.uint8)
-            
+
         # Ensure mask is binary
         mask_np = (mask_np > 0.5).astype(np.float32)
         
@@ -165,13 +164,10 @@ class CAIPIAugmentation:
                     mask_np * transformed_image[:, :, c]
                 )
             
-            # Convert back to tensor
-            augmented_tensor = torch.from_numpy(augmented_image).permute(2, 0, 1).float()
-            
-            # Normalize back to 0-1 range if needed
-            if image.max() <= 1.0:
-                augmented_tensor = augmented_tensor / 255.0
-                
+            # Convert back to tensor and re-apply ImageNet normalization
+            augmented_tensor = torch.from_numpy(augmented_image).permute(2, 0, 1).float() / 255.0
+            augmented_tensor = (augmented_tensor - _mean) / _std
+
             counterexamples.append((augmented_tensor, label))
             
         return counterexamples

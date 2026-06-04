@@ -2,8 +2,10 @@
 Right for the Right Reasons (RRR) model implementation.
 """
 
+import pandas as pd
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 from .architectures import GenderClassifier
 
 
@@ -41,7 +43,7 @@ class RRRGenderClassifier(GenderClassifier):
             return self.backbone(x)
 
 
-def rrr_loss_function(A, X, y, logits, criterion, class_weights=None, l2_grads=1000, reduce_func=torch.sum):
+def rrr_loss_function(A, X, y, logits, criterion, class_weights=None, l2_grads=1000, reduce_func=torch.mean):
     """
     Right for the Right Reasons loss function.
     
@@ -62,19 +64,16 @@ def rrr_loss_function(A, X, y, logits, criterion, class_weights=None, l2_grads=1
         Tuple of (total_loss, right_answer_loss, right_reason_loss)
     """
     
-    # Apply log softmax to logits
-    log_softmax = nn.LogSoftmax(dim=1)
-    log_prob_ys = log_softmax(logits)
-    
     # Right answers loss - standard classification loss
-    right_answer_loss = criterion(log_prob_ys, y)
-    
+    # logits: log-probs (NLLLoss models) or raw logits (CrossEntropyLoss models)
+    right_answer_loss = criterion(logits, y)
+
     # Right reasons loss - gradient regularization
-    # Calculate gradients of log probabilities w.r.t. input
+    # Differentiate model output sum w.r.t. input pixels
     gradXes = torch.autograd.grad(
-        outputs=log_prob_ys,
+        outputs=logits,
         inputs=X,
-        grad_outputs=torch.ones_like(log_prob_ys),
+        grad_outputs=torch.ones_like(logits),
         create_graph=True
     )[0]
     
@@ -101,9 +100,9 @@ def rrr_loss_function(A, X, y, logits, criterion, class_weights=None, l2_grads=1
     else:
         class_weights_batch = torch.ones_like(y, dtype=torch.float)
     
-    # Sum over spatial and channel dimensions to get penalty per sample
-    # Sum over dimensions 1, 2, 3 (C, H, W) keeping batch dimension
-    right_reason_penalty = torch.sum(A_gradX, dim=(1, 2, 3))
+    # Mean over spatial and channel dimensions — normalises by C×H×W so the
+    # penalty scale stays O(1) regardless of image resolution and batch size.
+    right_reason_penalty = torch.mean(A_gradX, dim=(1, 2, 3))
     
     # Apply class weights and reduction
     weighted_penalty = class_weights_batch * right_reason_penalty
@@ -143,52 +142,57 @@ class RRRTrainer:
     def train_epoch(self, train_loader):
         """Train for one epoch with RRR loss."""
         self.model.train()
-        
+
         running_loss = 0.0
         running_answer_loss = 0.0
         running_reason_loss = 0.0
         running_corrects = 0
-        
-        for images, masks, labels in train_loader:
+
+        pbar = tqdm(train_loader, desc='Training RRR', leave=False)
+        for images, masks, labels in pbar:
             images = images.to(self.device)
             masks = masks.to(self.device)
             labels = labels.to(self.device)
-            
+
             # Ensure images require gradients for RRR
             images.requires_grad_(True)
-            
-            # Forward pass
+
+            self.optimizer.zero_grad()
+
+            # Forward pass (BLA returns (logits, attn); unpack if needed)
             outputs = self.model(images)
-            
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
+
             # Compute RRR loss
             loss, answer_loss, reason_loss = rrr_loss_function(
                 A=masks,
-                X=images, 
+                X=images,
                 y=labels,
                 logits=outputs,
                 criterion=self.criterion,
                 class_weights=self.class_weights,
                 l2_grads=self.l2_grads
             )
-            
-            # Backward pass
-            self.optimizer.zero_grad()
+
             loss.backward()
             self.optimizer.step()
-            
+
             # Statistics
             running_loss += loss.item() * images.size(0)
             running_answer_loss += answer_loss.item() * images.size(0)
             running_reason_loss += reason_loss.item() * images.size(0)
-            
+
             _, preds = torch.max(outputs, 1)
             running_corrects += torch.sum(preds == labels.data)
-            
+
+            pbar.set_postfix(loss=f'{loss.item():.3f}', ans=f'{answer_loss.item():.3f}', rr=f'{reason_loss.item():.3f}')
+
         epoch_loss = running_loss / len(train_loader.dataset)
         epoch_answer_loss = running_answer_loss / len(train_loader.dataset)
         epoch_reason_loss = running_reason_loss / len(train_loader.dataset)
         epoch_acc = running_corrects.double() / len(train_loader.dataset)
-        
+
         return {
             'loss': epoch_loss,
             'answer_loss': epoch_answer_loss,
@@ -207,8 +211,10 @@ class RRRTrainer:
             for images, masks, labels in val_loader:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
-                
+
                 outputs = self.model(images)
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]
                 loss = self.criterion(outputs, labels)
                 
                 running_loss += loss.item() * images.size(0)
@@ -218,8 +224,51 @@ class RRRTrainer:
                 
         epoch_loss = running_loss / len(val_loader.dataset)
         epoch_acc = running_corrects.double() / len(val_loader.dataset)
-        
+
         return {
             'loss': epoch_loss,
             'accuracy': epoch_acc.item()
         }
+
+    def test_epoch(self, test_loader):
+        """Alias of validate_epoch for the test set."""
+        return self.validate_epoch(test_loader)
+
+    def train(self, train_loader, val_loader, test_loader, epochs, save_path=None, **kwargs):
+        """
+        Full training loop matching the BaseTrainer interface.
+
+        Returns a DataFrame of per-epoch metrics.
+        """
+        history = {
+            'train_loss': [], 'train_acc': [],
+            'val_loss': [],   'val_acc': [],
+            'test_loss': [],  'test_acc': [],
+        }
+        best_val_acc = 0.0
+
+        for epoch in range(epochs):
+            print(f'\nEpoch {epoch + 1}/{epochs}', flush=True)
+            tr = self.train_epoch(train_loader)
+            vl = self.validate_epoch(val_loader)
+            te = self.validate_epoch(test_loader)
+
+            history['train_loss'].append(tr['loss'])
+            history['train_acc'].append(tr['accuracy'])
+            history['val_loss'].append(vl['loss'])
+            history['val_acc'].append(vl['accuracy'])
+            history['test_loss'].append(te['loss'])
+            history['test_acc'].append(te['accuracy'])
+
+            print(f"  Train loss={tr['loss']:.4f}  acc={tr['accuracy']:.4f}  rr_loss={tr.get('reason_loss', 0):.4f}", flush=True)
+            print(f"  Val   loss={vl['loss']:.4f}  acc={vl['accuracy']:.4f}", flush=True)
+            print(f"  Test  loss={te['loss']:.4f}  acc={te['accuracy']:.4f}", flush=True)
+
+            if vl['accuracy'] > best_val_acc and save_path:
+                best_val_acc = vl['accuracy']
+                torch.save(self.model.state_dict(), save_path)
+
+            if self.scheduler:
+                self.scheduler.step()
+
+        return pd.DataFrame(history)
