@@ -328,12 +328,12 @@ def make_coco_explanation_grid(
     n_images = len(image_rows)
     n_cols   = 1 + len(model_configs)
     fig, axes = plt.subplots(n_images, n_cols,
-                              figsize=(2.5 * n_cols, 2.8 * n_images),
+                              figsize=(3.2 * n_cols, 3.4 * n_images),
                               squeeze=False)
 
-    axes[0, 0].set_title('Original\n+ BBox', fontsize=8, fontweight='bold')
+    axes[0, 0].set_title('Original\n+ BBox', fontsize=14, fontweight='bold')
     for j, mc in enumerate(model_configs):
-        axes[0, j + 1].set_title(mc['label'], fontsize=7, fontweight='bold')
+        axes[0, j + 1].set_title(mc['label'], fontsize=12, fontweight='bold')
 
     print(f"  Loading {len(model_configs)} model(s)...")
     loaded = []
@@ -360,7 +360,7 @@ def make_coco_explanation_grid(
         ax0.imshow(img_np)
         draw_bbox_rect(ax0, bbox_224)
         ax0.set_ylabel(f"{row.label_str}\n{os.path.basename(row.img_path)[:15]}",
-                       fontsize=6, rotation=0, labelpad=55, va='center')
+                       fontsize=11, rotation=0, labelpad=80, va='center')
         ax0.set_xticks([])
         ax0.set_yticks([])
 
@@ -392,7 +392,7 @@ def make_coco_explanation_grid(
             tick_sym = '✓' if correct else '✗'
             ax.set_xlabel(
                 f"{tick_sym}{pred_str}  BSR={bsr:.2f}",
-                fontsize=6, color='green' if correct else 'red'
+                fontsize=11, color='green' if correct else 'red'
             )
             ax.set_xticks([])
             ax.set_yticks([])
@@ -410,7 +410,7 @@ def make_coco_explanation_grid(
             })
 
     if title:
-        fig.suptitle(title, fontsize=10, fontweight='bold', y=1.01)
+        fig.suptitle(title, fontsize=15, fontweight='bold', y=1.01)
 
     fig.tight_layout(pad=0.5)
     fig.savefig(output_path, dpi=150, bbox_inches='tight')

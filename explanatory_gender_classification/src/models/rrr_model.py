@@ -43,13 +43,31 @@ class RRRGenderClassifier(GenderClassifier):
             return self.backbone(x)
 
 
-def rrr_loss_function(A, X, y, logits, criterion, class_weights=None, l2_grads=1000, reduce_func=torch.mean):
+def rrr_loss_function(A, X, y, logits, criterion, class_weights=None, l2_grads=1000, reduce_func=torch.mean,
+                      output_transform='native'):
     """
-    Right for the Right Reasons loss function.
-    
-    This implements the RRR loss from the paper which regularizes input gradients
-    in locations specified by annotation masks.
-    
+    Right for the Right Reasons loss (Ross, Hughes & Doshi-Velez, IJCAI 2017).
+
+    Original objective (their Sec. 2.1), with A[n, d] = 1 where input dimension d must be irrelevant:
+
+        L = sum_n sum_k -y_nk log(yhat_nk)
+            + lambda_1 * sum_n sum_d ( A[n, d] * d/dx[n, d] sum_k log(yhat_nk) )^2
+            + lambda_2 * ||theta||^2
+
+    i.e. the penalty acts on the input gradient of the SUM OVER CLASSES of the log-probabilities;
+    it does not depend on the label y.
+
+    Implementation here: cross-entropy is the batch mean (`criterion`), the penalty is the squared
+    masked input gradient averaged over (C, H, W) and then reduced over the batch with
+    `reduce_func`, multiplied by `l2_grads` (lambda). Hence lambda = 1000 on this averaged penalty
+    corresponds to lambda_1 = 1000 / (C*H*W), about 6.6e-3, in Ross et al.'s summed form for
+    3x224x224 inputs. Weight decay (lambda_2) is not used.
+
+    output_transform:
+        'native'      differentiate the sum of the model outputs as returned by the model
+                      (log-probabilities for the LogSoftmax GradCAM models; raw logits for BLA models)
+        'log_softmax' apply log_softmax first, i.e. exactly Ross et al.'s quantity for every model
+
     Args:
         A: Annotation masks (N x H x W) - indicates regions of interest
         X: Input images (N x C x H x W) - requires gradients
@@ -69,11 +87,17 @@ def rrr_loss_function(A, X, y, logits, criterion, class_weights=None, l2_grads=1
     right_answer_loss = criterion(logits, y)
 
     # Right reasons loss - gradient regularization
-    # Differentiate model output sum w.r.t. input pixels
+    # Differentiate the sum of the (transformed) model outputs w.r.t. the input pixels
+    if output_transform == 'log_softmax':
+        penalised_outputs = torch.log_softmax(logits, dim=1)
+    elif output_transform == 'native':
+        penalised_outputs = logits
+    else:
+        raise ValueError(f"unknown output_transform: {output_transform}")
     gradXes = torch.autograd.grad(
-        outputs=logits,
+        outputs=penalised_outputs,
         inputs=X,
-        grad_outputs=torch.ones_like(logits),
+        grad_outputs=torch.ones_like(penalised_outputs),
         create_graph=True
     )[0]
     
@@ -118,7 +142,7 @@ class RRRTrainer:
     """Trainer specifically for RRR models."""
     
     def __init__(self, model, criterion, optimizer, scheduler=None, device='cuda', 
-                 l2_grads=1000, class_weights=None):
+                 l2_grads=1000, class_weights=None, output_transform='native'):
         """
         Initialize RRR trainer.
         
@@ -138,6 +162,7 @@ class RRRTrainer:
         self.device = device
         self.l2_grads = l2_grads
         self.class_weights = class_weights
+        self.output_transform = output_transform
         
     def train_epoch(self, train_loader):
         """Train for one epoch with RRR loss."""
@@ -172,7 +197,8 @@ class RRRTrainer:
                 logits=outputs,
                 criterion=self.criterion,
                 class_weights=self.class_weights,
-                l2_grads=self.l2_grads
+                l2_grads=self.l2_grads,
+                output_transform=self.output_transform
             )
 
             loss.backward()

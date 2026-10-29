@@ -300,7 +300,7 @@ def prepare_data_splits_from_dataset_folder(gender_dataset_path):
         
         # Extract label from image path and create full path
         def process_row(row):
-            image_path = row['image']
+            image_path = str(row['image']).replace(chr(92), '/')  # split files use Windows separators; make them portable
             
             # Extract gender from path
             if 'female' in image_path.lower():

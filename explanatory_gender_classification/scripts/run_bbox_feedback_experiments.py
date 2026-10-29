@@ -1,4 +1,3 @@
-"""Run bounding-box feedback experiments comparing bbox vs segmentation mask feedback."""
 import os
 import argparse
 import pandas as pd
@@ -30,8 +29,14 @@ from evaluation.bias_metrics import evaluate_model_bias
 from evaluation.classification_metrics import compute_classification_metrics
 from explainability.gradcam import GradCAM
 from explainability.bla import BLAWrapper, create_bla_model
+from training.selection import IndexedDataset, BudgetedFeedbackLoader
+from torch.utils.data import DataLoader
 
-def evaluate_and_log(model, test_loader, device, explainer, results_dir, exp_config, run_id):
+# Protocol settings that are written to every results row (see run_experiment / main).
+PROTOCOL_KEYS = ['feedback_noise', 'feedback_noise_level', 'sampling_mode', 'samples_per_epoch', 'rrr_lambda', 'rrr_output', 'backbone_mode',
+                 'augmentation', 'eval_reference', 'batch_size', 'epochs']
+
+def evaluate_and_log(model, test_loader, device, explainer, results_dir, exp_config, run_id, aux_eval_loader=None):
     """Evaluate model and save detailed metrics."""
     print(f"  -> Classification pass...", flush=True)
     
@@ -87,6 +92,10 @@ def evaluate_and_log(model, test_loader, device, explainer, results_dir, exp_con
     )
     print(f"  -> Bias metrics done: FFP={bias_metrics.get('FFP',0):.3f}, BSR={bias_metrics.get('BSR',0):.3f}", flush=True)
     
+    if aux_eval_loader is not None:
+        aux = evaluate_model_bias(model, aux_eval_loader, explainer, device=device)
+        bias_metrics.update({f'{k}_bboxref': v for k, v in aux.items()})
+
     # Combine results
     results = {
         'run_id': run_id,
@@ -97,6 +106,7 @@ def evaluate_and_log(model, test_loader, device, explainer, results_dir, exp_con
         'k': exp_config['k'],
         'explainer': exp_config['explainer'],
         'seed': exp_config['seed'],
+        **{k: exp_config[k] for k in PROTOCOL_KEYS if k in exp_config},
         **clf_metrics,
         **bias_metrics
     }
@@ -115,6 +125,14 @@ def evaluate_and_log(model, test_loader, device, explainer, results_dir, exp_con
     results['male_error_rate'] = cm[1][0] / male_total if male_total > 0 else 0
     results['error_rate_gap'] = abs(results['female_error_rate'] - results['male_error_rate'])
     
+    results_path = os.path.join(results_dir, 'results.csv')
+    df_res = pd.DataFrame([results])
+    if os.path.exists(results_path):
+        old_cols = [c for c in pd.read_csv(results_path, nrows=0).columns
+                    if c not in ('runtime_minutes', 'model_checkpoint_path')]  # appended after the run
+        if old_cols != list(df_res.columns):
+            raise RuntimeError(f'{results_path} has a different column layout (earlier protocol). '
+                               'Use a fresh --results_dir for runs with the current protocol columns.')
     # Log individual predictions
     df_preds = pd.DataFrame(all_metadata)
     if not df_preds.empty:
@@ -154,10 +172,44 @@ def get_explainer(model, explainer_name, device):
         target_layer = base_model.layer4
     return GradCAM(model, target_layer=target_layer)
 
+
+def _freeze_bla_backbone(model):
+    for p in model.feature_extractor.parameters():
+        p.requires_grad = False
+
+
+def build_models_for(exp_config, args, device):
+    """Return (model, criterion). backbone_mode: legacy | trainable | frozen.
+    legacy
+    trainable = every model is fine-tuned end to end
+    frozen    = every model keeps the ImageNet backbone frozen (BLA module + classifier remain trainable)
+    """
+    bla = exp_config.get('explainer') == 'bla' and exp_config['method'] in ('rrr', 'hybrid')
+    gc_frozen = args.backbone_mode in ('legacy', 'frozen')
+    if bla:
+        model = create_bla_model('efficientnet_b0', num_classes=2, pretrained=True).to(device)
+        if args.backbone_mode == 'frozen':
+            _freeze_bla_backbone(model)
+        return model, nn.CrossEntropyLoss()
+    if exp_config['method'] == 'rrr':
+        return RRRGenderClassifier(pretrained=True, freeze_backbone=gc_frozen).to(device), nn.NLLLoss()
+    return create_model(pretrained=True, freeze_backbone=gc_frozen).to(device), nn.NLLLoss()
+
+
 def run_experiment(exp_config, data_splits, device, args):
     """Run a single experiment configuration."""
     train_df, val_df, test_df = data_splits
     run_id = f"{exp_config['method']}_{exp_config['feedback_type']}_k{exp_config['k']}_{exp_config['sampling_strategy']}_{exp_config['explainer']}_{exp_config['seed']}"
+    if args.tag:
+        run_id = f"{run_id}__{args.tag}"
+    exp_config = {**exp_config,
+                  'sampling_mode': args.sampling_mode, 'samples_per_epoch': args.samples_per_epoch,
+                  'feedback_noise': args.feedback_noise, 'feedback_noise_level': args.feedback_noise_level,
+                  'rrr_lambda': args.rrr_lambda, 'rrr_output': args.rrr_output,
+                  'backbone_mode': args.backbone_mode,
+                  'augmentation': 'image_only(legacy)' if args.legacy_augmentation else 'joint_image_mask',
+                  'eval_reference': args.eval_reference, 'batch_size': args.batch_size,
+                  'epochs': args.epochs if args.epochs is not None else Config.EPOCHS}
 
     # Skip if this run_id already exists in results.csv (allows safe re-runs after crash)
     results_path = os.path.join(args.results_dir, 'results.csv')
@@ -185,56 +237,58 @@ def run_experiment(exp_config, data_splits, device, args):
 
     train_loader, val_loader, test_loader = create_xil_data_loaders(
         train_df, val_df, test_df,
-        batch_size=Config.BATCH_SIZE,
+        batch_size=args.batch_size,
         use_masks=use_masks,
         mask_source=mask_source,
         female_masks_path=female_masks_path,
-        male_masks_path=male_masks_path
+        male_masks_path=male_masks_path,
+        legacy_augmentation=args.legacy_augmentation,
+        feedback_noise=args.feedback_noise, feedback_noise_level=args.feedback_noise_level
     )
+    # Evaluation reference: BSR/DICE are computed against a FIXED person segmentation mask for every
+    # model (so that values are comparable across feedback types and for the unsteered baseline).
+    # --eval_reference feedback restores the earlier behaviour (each model's own feedback mask).
+    aux_eval_loader = None
+    eval_test_loader = test_loader
+    if args.eval_reference in ('segmentation', 'both') and mask_source != 'segmentation':
+        _, _, eval_test_loader = create_xil_data_loaders(
+            train_df, val_df, test_df, batch_size=args.batch_size, use_masks=True,
+            mask_source='segmentation', female_masks_path=female_masks_path, male_masks_path=male_masks_path)
+        if args.eval_reference == 'both':
+            aux_eval_loader = test_loader
+    elif args.eval_reference == 'both':
+        _, _, aux_eval_loader = create_xil_data_loaders(
+            train_df, val_df, test_df, batch_size=args.batch_size, use_masks=True,
+            mask_source='bbox_from_segmentation', female_masks_path=female_masks_path,
+            male_masks_path=male_masks_path)
     print(f"     train={len(train_loader.dataset)}, val={len(val_loader.dataset)}, test={len(test_loader.dataset)} samples", flush=True)
 
     # 2. Setup Model & Trainer
     start_time = time.time()
     print(f"[2/5] Setting up model and trainer (method={exp_config['method']})...", flush=True)
 
+    model, criterion = build_models_for(exp_config, args, device)
+    optimizer = Adam([p for p in model.parameters() if p.requires_grad], lr=Config.LEARNING_RATE) \
+        if args.backbone_mode != 'legacy' else Adam(model.parameters(), lr=Config.LEARNING_RATE)
+    skip_empty = (args.sampling_mode == 'selected')
+
     if exp_config['method'] == 'baseline':
-        model = create_model(pretrained=True).to(device)
-        criterion = nn.NLLLoss()
-        optimizer = Adam(model.parameters(), lr=Config.LEARNING_RATE)
         trainer = BaseTrainer(model, criterion=criterion, optimizer=optimizer, device=device)
-
     elif exp_config['method'] == 'caipi':
-        model = create_model(pretrained=True).to(device)
-        criterion = nn.NLLLoss()
-        optimizer = Adam(model.parameters(), lr=Config.LEARNING_RATE)
-
-        caipi_aug = CAIPIAugmentation(k=exp_config['k'])
-        trainer = CAIPITrainer(model, criterion=criterion, optimizer=optimizer, caipi_augmenter=caipi_aug, device=device)
-
+        caipi_aug = CAIPIAugmentation(k=exp_config['k'], sequence=getattr(args, 'caipi_sequence', False))
+        trainer = CAIPITrainer(model, criterion=criterion, optimizer=optimizer, caipi_augmenter=caipi_aug,
+                               device=device, skip_empty_feedback=skip_empty)
     elif exp_config['method'] == 'rrr':
-        if exp_config.get('explainer') == 'bla':
-            model = create_bla_model('efficientnet_b0', num_classes=2, pretrained=True).to(device)
-            criterion = nn.CrossEntropyLoss()
-        else:
-            model = RRRGenderClassifier(pretrained=True).to(device)
-            criterion = nn.NLLLoss()
-        optimizer = Adam(model.parameters(), lr=Config.LEARNING_RATE)
-        trainer = RRRTrainer(model, criterion=criterion, optimizer=optimizer, device=device)
-
+        trainer = RRRTrainer(model, criterion=criterion, optimizer=optimizer, device=device,
+                             l2_grads=args.rrr_lambda, output_transform=args.rrr_output)
     elif exp_config['method'] == 'hybrid':
-        if exp_config.get('explainer') == 'bla':
-            # BLA needs a model that returns (logits, attention_weights)
-            model = create_bla_model('efficientnet_b0', num_classes=2, pretrained=True).to(device)
-            criterion = nn.CrossEntropyLoss()   # ModelWithBLA outputs raw logits
-        else:
-            model = create_model(pretrained=True).to(device)
-            criterion = nn.NLLLoss()
-        optimizer = Adam(model.parameters(), lr=Config.LEARNING_RATE)
         trainer = HybridXILTrainer(
             model, criterion=criterion, optimizer=optimizer, device=device,
-            caipi_k=exp_config['k'], rrr_lambda=1000.0
+            caipi_k=exp_config['k'], rrr_lambda=args.rrr_lambda, caipi_sequence=getattr(args, 'caipi_sequence', False),
+            output_transform=args.rrr_output, skip_empty_feedback=skip_empty,
+            joint_forward=getattr(args, 'hybrid_joint_forward', False)
         )
-        
+
     class TrainLoaderWrapper:
         def __init__(self, loader, method): 
             self.loader = loader
@@ -251,7 +305,19 @@ def run_experiment(exp_config, data_splits, device, args):
                     yield batch[0], batch[2], batch[1]  # image, feedback_mask, label
         def __len__(self): return len(self.loader)
 
-    wrapped_train_loader = TrainLoaderWrapper(train_loader, exp_config['method'])
+    if args.sampling_mode == 'selected' and exp_config['method'] != 'baseline':
+        # Budgeted feedback: per epoch only `samples_per_epoch` samples, chosen by the sampling strategy
+        # with the current model, keep their feedback mask (see training/selection.py).
+        indexed_loader = DataLoader(IndexedDataset(train_loader.dataset), batch_size=args.batch_size,
+                                    shuffle=True, num_workers=0)
+        _, score_loader, _ = create_xil_data_loaders(
+            train_df, train_df, train_df, batch_size=args.batch_size, use_masks=True,
+            mask_source=mask_source, female_masks_path=female_masks_path, male_masks_path=male_masks_path)
+        wrapped_train_loader = BudgetedFeedbackLoader(
+            indexed_loader, score_loader, model, exp_config['sampling_strategy'],
+            args.samples_per_epoch, device)
+    else:
+        wrapped_train_loader = TrainLoaderWrapper(train_loader, exp_config['method'])
     wrapped_val_loader = TrainLoaderWrapper(val_loader, exp_config['method'])
     wrapped_test_loader = TrainLoaderWrapper(test_loader, exp_config['method'])
 
@@ -268,6 +334,11 @@ def run_experiment(exp_config, data_splits, device, args):
         os.makedirs(history_dir, exist_ok=True)
         history.insert(0, 'run_id', run_id)
         history.to_csv(os.path.join(history_dir, f'{run_id}.csv'), index=False)
+
+    if isinstance(wrapped_train_loader, BudgetedFeedbackLoader):
+        os.makedirs(os.path.join(args.results_dir, 'selected_indices'), exist_ok=True)
+        with open(os.path.join(args.results_dir, 'selected_indices', f'{run_id}.json'), 'w') as fh:
+            json.dump(wrapped_train_loader.history, fh)
 
     # 4. Save Checkpoint
     print(f"[4/5] Saving checkpoint...", flush=True)
@@ -297,7 +368,8 @@ def run_experiment(exp_config, data_splits, device, args):
     
     results = evaluate_and_log(
         model=model,
-        test_loader=test_loader, # Pass full loader for our custom evaluate_and_log
+        aux_eval_loader=aux_eval_loader,
+        test_loader=eval_test_loader, # evaluation reference chosen by --eval_reference
         device=device,
         explainer=explainer,
         results_dir=args.results_dir,
@@ -319,7 +391,8 @@ def run_experiment(exp_config, data_splits, device, args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, default='gender_dataset')
-    parser.add_argument('--results_dir', type=str, default='results/journal_extension/coco_bbox')
+    parser.add_argument('--results_dir', type=str, default='results/journal_extension/runs',
+                        help='ALWAYS pass a fresh directory per protocol; the first journal results live in results/journal_extension/coco_bbox and must not be written to')
     parser.add_argument('--methods', nargs='+', default=['caipi', 'rrr', 'hybrid'])
     parser.add_argument('--feedback_types', nargs='+', default=['segmentation', 'bbox'])
     parser.add_argument('--sampling_strategies', nargs='+', default=['high_confidence', 'uncertainty'])
@@ -332,6 +405,31 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--epochs', type=int, default=None, help='Override default epochs')
     parser.add_argument('--dry_run', action='store_true', help='Set up configs but do not train')
+    # --- protocol options (every value is written to results.csv) ---
+    parser.add_argument('--sampling_mode', choices=['all', 'selected'], default='all',
+                        help="all: feedback for every training image in every epoch (sampling_strategy is then only a label); "
+                             "selected: budgeted feedback, --samples_per_epoch samples per epoch chosen by the sampling strategy")
+    parser.add_argument('--samples_per_epoch', type=int, default=5)
+    parser.add_argument('--caipi_sequence', action='store_true',
+                        help='CAIPI counterexample i uses the i-th transformation of the fixed sequence of the CBMI paper instead of a random one')
+    parser.add_argument('--hybrid_joint_forward', action='store_true',
+                        help='diagnostic: hybrid trainer passes originals and counterexamples through the model in ONE batch')
+    parser.add_argument('--rrr_lambda', type=float, default=Config.L2_GRADS,
+                        help='weight of the (pixel- and batch-averaged) RRR penalty; see models/rrr_model.py')
+    parser.add_argument('--rrr_output', choices=['native', 'log_softmax'], default='native',
+                        help='quantity whose input gradient is penalised (see rrr_loss_function)')
+    parser.add_argument('--backbone_mode', choices=['legacy', 'trainable', 'frozen'], default='legacy',
+                        help='legacy; trainable: all fine-tuned; frozen: all frozen')
+    parser.add_argument('--legacy_augmentation', action='store_true',
+                        help='image-only flip/rotation (masks not transformed); only to reproduce earlier runs')
+    parser.add_argument('--eval_reference', choices=['segmentation', 'feedback', 'both'], default='segmentation',
+                        help='mask used as foreground for BSR/DICE/FFP/BFP')
+    parser.add_argument('--batch_size', type=int, default=Config.BATCH_SIZE)
+    parser.add_argument('--feedback_noise', choices=['none', 'shift', 'dilate', 'drop', 'bbox_centroid', 'bbox_jitter'], default='none',
+                        help='simulate imperfect user feedback in the training masks (see XILGenderDataset)')
+    parser.add_argument('--feedback_noise_level', type=float, default=0.0)
+    parser.add_argument('--tag', type=str, default='', help='suffix appended to run ids')
+    parser.add_argument('--debug_subset', type=int, default=0, help='smoke tests only: use N images per split')
     args = parser.parse_args()
     
     print(f"Starting experiments with args: {args}")
@@ -361,6 +459,9 @@ def main():
             for df in [train_df, val_df, test_df]:
                 df['full_path'] = df.apply(lambda row: os.path.join(female_path if 'female' in str(row['label']).lower() else male_path, row['image']), axis=1)
             
+    if args.debug_subset:
+        train_df, val_df, test_df = (d.groupby('label', group_keys=False).head(args.debug_subset // 2).reset_index(drop=True)
+                                     for d in (train_df, val_df, test_df))
     data_splits = (train_df, val_df, test_df)
     
     # Build experiment configurations

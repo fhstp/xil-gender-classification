@@ -38,10 +38,20 @@ class HybridXILTrainer(BaseTrainer):
     """
 
     def __init__(self, model, criterion, optimizer, scheduler=None, device='cuda',
-                 caipi_k: int = 3, rrr_lambda: float = 1000.0):
+                 caipi_k: int = 3, rrr_lambda: float = 1000.0, caipi_sequence: bool = False,
+                 output_transform: str = 'native', skip_empty_feedback: bool = False,
+                 joint_forward: bool = False):
         super().__init__(model, criterion, optimizer, scheduler, device)
-        self.caipi = CAIPIAugmentation(k=caipi_k)
+        self.caipi = CAIPIAugmentation(k=caipi_k, sequence=caipi_sequence)
         self.rrr_lambda = rrr_lambda
+        # 'native' = penalise the summed model outputs as returned (log-probs / raw logits);
+        # 'log_softmax' = Ross et al.'s summed log-probabilities for every model.
+        self.output_transform = output_transform
+        # True: samples whose feedback mask is all zeros (= no feedback given this epoch) get no
+        # counterexamples. Used by the budgeted-feedback mode (--sampling_mode selected).
+        self.skip_empty_feedback = skip_empty_feedback
+        # diagnostic: one forward pass over originals + counterexamples (BatchNorm sees both) instead of two passes
+        self.joint_forward = joint_forward
 
     # ------------------------------------------------------------------
     # Training epoch: CAIPI augmentation + RRR loss
@@ -67,6 +77,8 @@ class HybridXILTrainer(BaseTrainer):
             aug_images_list: list = []
             aug_labels_list: list = []
             for i in range(len(images)):
+                if self.skip_empty_feedback and masks[i].sum() == 0:
+                    continue
                 ces = self.caipi.generate_counterexamples(
                     images[i], masks[i], labels[i].item())
                 aug_images_list.extend(c[0] for c in ces)
@@ -80,15 +92,26 @@ class HybridXILTrainer(BaseTrainer):
 
             self.optimizer.zero_grad()
 
-            orig_out = self.model(orig_imgs)
-            if isinstance(orig_out, tuple):
-                orig_out = orig_out[0]
+            n_orig = orig_imgs.size(0)
+            aug_out_joint = None
+            if self.joint_forward and aug_images_list:
+                aug_all = torch.stack(aug_images_list).to(self.device)
+                all_out = self.model(torch.cat([orig_imgs, aug_all], dim=0))
+                if isinstance(all_out, tuple):
+                    all_out = all_out[0]
+                orig_out, aug_out_joint = all_out[:n_orig], all_out[n_orig:]
+            else:
+                orig_out = self.model(orig_imgs)
+                if isinstance(orig_out, tuple):
+                    orig_out = orig_out[0]
             ce_loss = self.criterion(orig_out, orig_labels)
 
             # ── 3. RRR gradient penalty ────────────────────────────────
-            # d(sum(logits)) / d(input pixels) — penalised in irrelevant regions
+            # d(sum of model outputs) / d(input pixels), penalised in irrelevant regions (see rrr_loss_function)
+            penalised = (torch.log_softmax(orig_out, dim=1)
+                         if self.output_transform == 'log_softmax' else orig_out)
             grad_x = torch.autograd.grad(
-                outputs=orig_out.sum(),
+                outputs=penalised.sum(),
                 inputs=orig_imgs,
                 create_graph=True,
             )[0]  # (B, C, H, W)
@@ -109,9 +132,12 @@ class HybridXILTrainer(BaseTrainer):
                 aug_imgs_t = torch.stack(aug_images_list).to(self.device)
                 aug_lbs_t  = torch.tensor(aug_labels_list, dtype=torch.long,
                                           device=self.device)
-                aug_out = self.model(aug_imgs_t)
-                if isinstance(aug_out, tuple):
-                    aug_out = aug_out[0]
+                if aug_out_joint is not None:
+                    aug_out = aug_out_joint
+                else:
+                    aug_out = self.model(aug_imgs_t)
+                    if isinstance(aug_out, tuple):
+                        aug_out = aug_out[0]
                 aug_ce_loss = self.criterion(aug_out, aug_lbs_t)
 
             total_loss = ce_loss + rrr_penalty + aug_ce_loss

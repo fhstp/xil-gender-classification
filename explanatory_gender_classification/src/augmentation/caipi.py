@@ -22,7 +22,7 @@ class CAIPIAugmentation:
     transformations to irrelevant regions of images while keeping relevant regions intact.
     """
     
-    def __init__(self, k: int = 3, transformations: Optional[List[str]] = None):
+    def __init__(self, k: int = 3, transformations: Optional[List[str]] = None, sequence: bool = False):
         """
         Initialize CAIPI augmentation.
         
@@ -31,6 +31,9 @@ class CAIPIAugmentation:
             transformations: List of transformation names to apply
         """
         self.k = k
+        # sequence=True
+        # sequence (inversion, posterization, equalization, color jittering, solarization); False = one random transformation each
+        self.sequence = sequence
         
         if transformations is None:
             self.transformations = [
@@ -151,7 +154,7 @@ class CAIPIAugmentation:
             augmented_image = image_np.copy()
             
             # Select random transformation
-            transform_name = random.choice(self.transformations)
+            transform_name = self.transformations[i % len(self.transformations)] if self.sequence else random.choice(self.transformations)
             
             # Apply transformation to the entire image
             transformed_image = self.apply_transformation(augmented_image, transform_name)

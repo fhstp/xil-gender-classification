@@ -1,13 +1,15 @@
-"""CAIPI (Counterexample-Augmented Interactive Learning) trainer."""
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 from .trainer import BaseTrainer
 
 class CAIPITrainer(BaseTrainer):
-    def __init__(self, model, criterion, optimizer, caipi_augmenter, scheduler=None, device='cuda'):
+    def __init__(self, model, criterion, optimizer, caipi_augmenter, scheduler=None, device='cuda',
+                 skip_empty_feedback=False):
         super().__init__(model, criterion, optimizer, scheduler, device)
         self.caipi = caipi_augmenter
+        # True: samples with an all-zero feedback mask (no feedback this epoch) get no counterexamples
+        self.skip_empty_feedback = skip_empty_feedback
         
     def train_epoch(self, train_loader):
         self.model.train()
@@ -24,6 +26,8 @@ class CAIPITrainer(BaseTrainer):
             aug_labels_list = []
             
             for i in range(len(images)):
+                if self.skip_empty_feedback and masks[i].sum() == 0:
+                    continue
                 counterexamples = self.caipi.generate_counterexamples(images[i], masks[i], labels[i].item())
                 aug_images_list.extend([c[0] for c in counterexamples])
                 aug_labels_list.extend([c[1] for c in counterexamples])
